@@ -607,3 +607,308 @@ COMMIT;
 
 ## RESTfull сервіс для управління даними
 
+### Ініціалізування FastAPI, підключення бази даних та реєстрування маршрутизаторів.
+
+**main.py**
+
+```python
+from fastapi import FastAPI
+from database import engine, Base
+from routes import router
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+
+app.include_router(router)
+```
+
+### Налаштування підключення до бази даних MySQL через SQLAlchemy та створення сесій для ORM.
+
+**database.py**
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from config import DB_PASSWORD
+
+SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://root:{DB_PASSWORD}@127.0.0.1:3306/media_system"
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+```
+
+
+### Визначення ORM-моделей для сутностей User та AnalysisReport разом із їхніми взаємозв’язками.
+
+**models.py**
+
+```python
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+from sqlalchemy.schema import PrimaryKeyConstraint
+from database import Base
+from datetime import datetime, timezone, timedelta
+
+# ---------------------------------------------------------------------
+#                          U S E R   M O D E L
+# ---------------------------------------------------------------------
+
+class User(Base):
+    __tablename__ = "User"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    first_name = Column(String(45))
+    last_name = Column(String(45))
+    email = Column(String(45), unique=True)
+    password = Column(String(45))
+
+    reports = relationship("AnalysisReport", back_populates="user")
+
+# ---------------------------------------------------------------------
+#             A N A L Y S I S   R E P O R T   M O D E L
+# ---------------------------------------------------------------------
+
+class AnalysisReport(Base):
+    __tablename__ = "AnalysisReport"
+
+    id = Column(Integer, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("User.id"))
+
+    title = Column(String(45))
+    body = Column(String(255))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc) + timedelta(hours=2))
+
+    __table_args__ = (
+        PrimaryKeyConstraint("id", "user_id"),
+    )
+
+    user = relationship("User", back_populates="reports")
+```
+
+
+### Створення Pydantic-схем для валідації та серіалізації даних сутностей User та AnalysisReport.
+
+**schemas.py**
+
+```python
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+
+# ------------------------------------------------------
+#                 U S E R   S C H E M A S
+# ------------------------------------------------------
+
+class UserCreate(BaseModel):
+    id: Optional[int] = None
+    first_name: str
+    last_name: str
+    email: str
+    password: str
+
+
+class UserResponse(UserCreate):
+    class Config:
+        orm_mode = True
+
+
+class UserPatch(BaseModel):
+    id: Optional[int] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+
+# ------------------------------------------------------
+#      A N A L Y S I S   R E P O R T   S C H E M A S
+# ------------------------------------------------------
+
+class AnalysisReportCreate(BaseModel):
+    id: Optional[int] = None
+    title: str
+    body: str
+    created_at: Optional[datetime] = None
+    user_id: int
+
+
+class AnalysisReportResponse(AnalysisReportCreate):
+    class Config:
+        orm_mode = True
+
+
+class AnalysisReportPatch(BaseModel):
+    id: Optional[int] = None
+    title: Optional[str] = None
+    body: Optional[str] = None
+    created_at: Optional[datetime] = None
+    user_id: Optional[int] = None
+```
+
+
+### Розробка CRUD-ендпойнтів для управління сутностями User та AnalysisReport через API.
+
+**routers.py**
+
+```python
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from typing import List
+from database import SessionLocal
+from models import User, AnalysisReport
+from schemas import (
+    UserCreate, UserResponse, UserPatch,
+    AnalysisReportCreate, AnalysisReportResponse, AnalysisReportPatch,
+)
+
+router = APIRouter()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# -----------------------------------------------------------------------------------------------
+#                                   U S E R   E N D P O I N T S
+# -----------------------------------------------------------------------------------------------
+
+@router.get("/user/", response_model=List[UserResponse])
+async def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    return db.query(User).offset(skip).limit(limit).all()
+
+@router.get("/user/{user_id}", response_model=UserResponse)
+async def read_user_by_id(user_id: int, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="UserNotFoundException")
+    return db_user
+
+@router.post("/user/", response_model=UserResponse)
+async def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    if user.id is not None:
+        existing_user = db.query(User).filter(User.id == user.id).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="AlreadyRegisteredException")
+
+    email_existing = db.query(User).filter(User.email == user.email).first()
+    if email_existing:
+        raise HTTPException(status_code=400, detail="EmailAlreadyExistsException")
+
+    if not user.first_name or not user.last_name or not user.email or not user.password:
+        raise HTTPException(status_code=400, detail="DataMissingException")
+
+    db_user = User(**user.dict(exclude_unset=True))
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@router.delete("/user/{user_id}", response_model=UserResponse)
+async def delete_user(user_id: int, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="UserNotFoundException")
+
+    db.delete(db_user)
+    db.commit()
+    return db_user
+
+@router.patch("/user/{user_id}", response_model=UserResponse)
+async def patch_user(user_id: int, user_patch: UserPatch, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == user_id).first()
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="UserNotFoundException")
+
+    updated_fields = user_patch.dict(exclude_unset=True)
+
+    if 'id' in updated_fields and updated_fields['id'] is not None and updated_fields['id'] != user_id:
+        new_id_user = db.query(User).filter(User.id == updated_fields['id']).first()
+        if new_id_user:
+            raise HTTPException(status_code=400, detail="AlreadyRegisteredException")
+
+    if 'email' in updated_fields:
+        email_existing = db.query(User).filter(User.email == updated_fields['email']).first()
+        if email_existing and email_existing.id != user_id:
+            raise HTTPException(status_code=400, detail="EmailAlreadyExistsException")
+
+    for key, value in updated_fields.items():
+        setattr(db_user, key, value)
+
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# -----------------------------------------------------------------------------------------------
+#                       A N A L Y S I S   R E P O R T   E N D P O I N T S
+# -----------------------------------------------------------------------------------------------
+
+@router.get("/analysisreport/", response_model=List[AnalysisReportResponse])
+async def read_reports(db: Session = Depends(get_db)):
+    return db.query(AnalysisReport).all()
+
+@router.get("/analysisreport/{report_id}", response_model=AnalysisReportResponse)
+async def read_report_by_id(report_id: int, db: Session = Depends(get_db)):
+    db_report = db.query(AnalysisReport).filter(AnalysisReport.id == report_id).first()
+    if db_report is None:
+        raise HTTPException(status_code=404, detail="AnalysisReportNotFoundException")
+    return db_report
+
+@router.post("/analysisreport/", response_model=AnalysisReportResponse)
+async def create_report(report: AnalysisReportCreate, db: Session = Depends(get_db)):
+    user_exists = db.query(User).filter(User.id == report.user_id).first()
+    if not user_exists:
+        raise HTTPException(status_code=404, detail="UserNotFoundException")
+
+    if report.id is not None:
+        exist_report = db.query(AnalysisReport).filter(AnalysisReport.id == report.id).first()
+        if exist_report:
+            raise HTTPException(status_code=400, detail="ReportIdExistsException")
+
+    if not report.title or not report.body or not report.user_id:
+        raise HTTPException(status_code=400, detail="RequiredFieldsMissingException")
+
+    db_report = AnalysisReport(**report.dict(exclude_unset=True))
+    db.add(db_report)
+    db.commit()
+    db.refresh(db_report)
+    return db_report
+
+@router.delete("/analysisreport/{report_id}", response_model=AnalysisReportResponse)
+async def delete_report(report_id: int, db: Session = Depends(get_db)):
+    db_report = db.query(AnalysisReport).filter(AnalysisReport.id == report_id).first()
+    if db_report is None:
+        raise HTTPException(status_code=404, detail="AnalysisReportNotFoundException")
+
+    db.delete(db_report)
+    db.commit()
+    return db_report
+
+@router.patch("/analysisreport/{report_id}", response_model=AnalysisReportResponse)
+async def patch_report(report_id: int, report_patch: AnalysisReportPatch, db: Session = Depends(get_db)):
+    db_report = db.query(AnalysisReport).filter(AnalysisReport.id == report_id).first()
+    if db_report is None:
+        raise HTTPException(status_code=404, detail="AnalysisReportNotFoundException")
+
+    updated_fields = report_patch.dict(exclude_unset=True)
+
+    if 'id' in updated_fields and updated_fields['id'] is not None and updated_fields['id'] != report_id:
+        exist_report = db.query(AnalysisReport).filter(AnalysisReport.id == updated_fields['id']).first()
+        if exist_report:
+            raise HTTPException(status_code=400, detail="ReportIdExistsException")
+
+    if 'user_id' in updated_fields and updated_fields['user_id'] is not None:
+        user_exists = db.query(User).filter(User.id == updated_fields['user_id']).first()
+        if not user_exists:
+            raise HTTPException(status_code=404, detail="UserNotFoundException")
+
+    for key, value in updated_fields.items():
+        setattr(db_report, key, value)
+
+    db.commit()
+    db.refresh(db_report)
+    return db_report
+```
